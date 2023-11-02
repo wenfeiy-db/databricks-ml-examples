@@ -14,8 +14,46 @@
 # COMMAND ----------
 
 # MAGIC %pip install --upgrade "mlflow-skinny[databricks]>=2.6.0"
-# MAGIC %pip install --upgrade "transformers>=4.31.0,<4.34.0" # Llama-2-70B uses Grouped Query Attention that requires transformers>=4.31.0
+# MAGIC %pip install --upgrade "transformers>=4.31.0" # Llama-2-70B uses Grouped Query Attention that requires transformers>=4.31.0
 # MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
+import transformers
+transformers.__version__
+
+# COMMAND ----------
+
+import accelerate 
+accelerate.__version__
+
+# COMMAND ----------
+
+import flash_attn
+flash_attn.__version__
+
+# COMMAND ----------
+
+# MAGIC %pip install --upgrade transformers accelerate flash_attn
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
+import transformers
+transformers.__version__
+
+# COMMAND ----------
+
+import accelerate 
+accelerate.__version__
+
+# COMMAND ----------
+
+import flash_attn
+flash_attn.__version__
 
 # COMMAND ----------
 
@@ -49,6 +87,35 @@ import torch
 # Load model
 model = AutoModelForCausalLM.from_pretrained(model_name, revision=revision, torch_dtype=torch.bfloat16)
 tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
+
+# COMMAND ----------
+
+# model.to("cuda")
+
+# COMMAND ----------
+
+from transformers import AutoTokenizer, LlamaForCausalLM
+
+prompt = "Hey, are you conscious? Can you talk to me?"
+inputs = tokenizer(prompt, return_tensors="pt")
+print(inputs)
+
+# Generate
+generate_ids = model.generate(inputs.input_ids, max_length=30)
+
+# COMMAND ----------
+
+generate_ids
+
+# COMMAND ----------
+
+tokenizer.batch_decode(generate_ids)
+
+# COMMAND ----------
+
+# import transformers
+# pipeline = transformers.TextGenerationPipeline(model=model, tokenizer=tokenizer, device=torch.device("cuda"))
+# # pipeline("say something") 
 
 # COMMAND ----------
 
@@ -120,12 +187,18 @@ mlflow.set_registry_uri("databricks-uc")
 # Register model to Unity Catalog
 # This may take 9.5 minutes to complete
 
-registered_name = "models.default.llamav2_70b_chat_model"  # Note that the UC model name follows the pattern <catalog_name>.<schema_name>.<model_name>, corresponding to the catalog, schema, and registered model name
+registered_name = "models.default.llamav2_70b_chat_model_wenfei"  # Note that the UC model name follows the pattern <catalog_name>.<schema_name>.<model_name>, corresponding to the catalog, schema, and registered model name
 
+run_id = "1c97f604a24846498e7570d32f7e202e"
 result = mlflow.register_model(
-    "runs:/" + run.info.run_id + "/model",
+    "runs:/" + run_id + "/model",
     registered_name,
 )
+
+# result = mlflow.register_model(
+#     "runs:/" + run.info.run_id + "/model",
+#     registered_name,
+# )
 
 # COMMAND ----------
 
@@ -143,6 +216,20 @@ client.set_registered_model_alias(name=registered_name, alias="Champion", versio
 
 # COMMAND ----------
 
+# %pip install --upgrade "mlflow-skinny[databricks]>=2.6.0"
+# %pip install --upgrade "transformers>=4.31.0,<4.34.0" # Llama-2-70B uses Grouped Query Attention that requires transformers>=4.31.0
+# dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# # TODO: remove the cell
+# import mlflow
+
+# mlflow.set_registry_uri("databricks-uc")
+# registered_name = "models.default.llamav2_70b_chat_model_wenfei"
+
+# COMMAND ----------
+
 import mlflow
 
 loaded_model = mlflow.pyfunc.load_model(f"models:/{registered_name}@Champion")
@@ -150,8 +237,80 @@ loaded_model = mlflow.pyfunc.load_model(f"models:/{registered_name}@Champion")
 # Make a prediction using the loaded model
 loaded_model.predict(
     {"prompt": "What is large language model?"},
-    params={
-        "temperature": 0.5,
-        "max_new_tokens": 150,
-    }
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Create Optimized Model Serving Endpoint
+# MAGIC Once the model is registered, we can use API to create a Databricks GPU Model Serving Endpoint that serves the `LLaMAV2-70b` model.
+# MAGIC
+# MAGIC Note that the below deployment requires GPU model serving. For more information on GPU model serving, see the documentation([AWS](https://docs.databricks.com/en/machine-learning/model-serving/create-manage-serving-endpoints.html#gpu)|[Azure](https://learn.microsoft.com/en-us/azure/databricks/machine-learning/model-serving/create-manage-serving-endpoints#gpu)). The feature is in Public Preview.
+# MAGIC
+# MAGIC Models in LLaMA-V2 family are supported for Optimized LLM Serving, which provides an order of magnitude better throughput and latency improvement. For more information, see the documentation([AWS](https://docs.databricks.com/en/machine-learning/model-serving/llm-optimized-model-serving.html)|[Azure](https://learn.microsoft.com/en-us/azure/databricks/machine-learning/model-serving/llm-optimized-model-serving)). In this section, the endpoint will have optimized LLM serving enabled by default. To disable it, remove the `metadata = {"task": "llm/v1/completions"}` when calling `log_model` and run the notebook again.
+
+# COMMAND ----------
+
+# Provide a name to the serving endpoint
+endpoint_name = 'llama2-70b-completions'
+
+# COMMAND ----------
+
+databricks_url = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiUrl().getOrElse(None)
+token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().getOrElse(None)
+
+# COMMAND ----------
+
+import requests
+import json
+
+deploy_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+deploy_url = f'{databricks_url}/api/2.0/serving-endpoints'
+
+model_version = result  # the returned result of mlflow.register_model
+
+# Specify the type of compute (CPU, GPU_SMALL, GPU_MEDIUM, etc.)
+# Choose `GPU_MEDIUM_8` on AWS, and `GPU_LARGE_2` on Azure
+workload_type = "GPU_LARGE_2"
+
+# endpoint_config = {
+#     "name": endpoint_name,
+#     "config": {
+#         "served_models": [{
+#             "name": f'{model_version.name.replace(".", "_")}_{model_version.version}',
+#             "model_name": model_version.name,
+#             "model_version": model_version.version,
+#             "workload_type": workload_type,
+#             "workload_size": "Small",
+#             "scale_to_zero_enabled": "False"
+#         }]
+#     }
+# }
+
+endpoint_config = {
+    "name": endpoint_name,
+    "config": {
+        "served_models": [{
+            "name": f'models_default_llamav2_70b_chat_model_wenfei_3',
+            "model_name": "models.default.llamav2_70b_chat_model_wenfei",
+            "model_version": "3",
+            "workload_type": workload_type,
+            "workload_size": "Small",
+            "scale_to_zero_enabled": "False"
+        }]
+    }
+}
+
+endpoint_json = json.dumps(endpoint_config, indent='  ')
+# Send a POST request to the API
+deploy_response = requests.request(method='POST', headers=deploy_headers, url=deploy_url, data=endpoint_json)
+if deploy_response.status_code != 200:
+    raise Exception(f'Request failed with status {deploy_response.status_code}, {deploy_response.text}')
+# Show the response of the POST request
+# When first creating the serving endpoint, it should show that the state 'ready' is 'NOT_READY'
+# You can check the status on the Databricks model serving endpoint page, it is expected to take ~35 min for the serving endpoint to become ready
+print(deploy_response.json())
+
+# COMMAND ----------
+
+
